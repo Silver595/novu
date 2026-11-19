@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { ExecutionDetailsEntity, ExecutionDetailsRepository, MessageEntity } from '@novu/dal';
+import { BaseRepository, ExecutionDetailsEntity, ExecutionDetailsRepository, MessageEntity } from '@novu/dal';
 import { ChannelTypeEnum, ExecutionDetailsSourceEnum, ExecutionDetailsStatusEnum } from '@novu/shared';
 
 import { EmailEventStatusEnum, SmsEventStatusEnum } from '@novu/stateless';
@@ -22,7 +22,23 @@ export class CreateExecutionDetails {
 
     Logger.verbose({ executionDetailsEntity }, 'Creating execution details', LOG_CONTEXT);
 
-    await this.executionDetailsRepository.create(executionDetailsEntity, { writeConcern: 1 });
+    const delivery = command.webhook.resendDelivery;
+    if (delivery) {
+      const { _environmentId, _organizationId, _messageId } = executionDetailsEntity;
+      const _id = BaseRepository.stableObjectId(
+        'resend-webhook-delivery',
+        _environmentId,
+        _organizationId,
+        delivery.integrationId,
+        delivery.id
+      );
+      await this.executionDetailsRepository.findOrInsert(
+        { _id, _environmentId, _organizationId, _messageId },
+        executionDetailsEntity
+      );
+    } else {
+      await this.executionDetailsRepository.create(executionDetailsEntity, { writeConcern: 1 });
+    }
 
     Logger.verbose({ executionDetailsEntity }, 'Created execution details', LOG_CONTEXT);
   }

@@ -23,8 +23,10 @@ export class WebhookCommand extends EnvironmentCommand {
   @IsDefined()
   providerId: string;
 
+  resendDelivery?: { integrationId: string; id: string };
+
   @IsDefined()
-  body: any;
+  body: unknown;
 
   @IsDefined()
   type: WebhookTypes;

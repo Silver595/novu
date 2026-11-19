@@ -15,10 +15,11 @@ import {
   SmsFactory,
 } from '@novu/application-generic';
 import { IntegrationEntity, IntegrationQuery, IntegrationRepository, MessageRepository } from '@novu/dal';
-import { ChannelTypeEnum, FeatureFlagsKeysEnum, providers } from '@novu/shared';
+import { ChannelTypeEnum, EmailProviderIdEnum, FeatureFlagsKeysEnum, providers } from '@novu/shared';
 import { IEmailProvider, ISmsProvider } from '@novu/stateless';
 import { IWebhookResult } from '../../dtos/webhooks-response.dto';
 import { WebhookTypes } from '../../interfaces/webhook.interface';
+import { type WebhookCommand as ExecutionWebhookCommand } from '../execution-details/create-execution-details.command';
 import { CreateExecutionDetails } from '../execution-details/create-execution-details.usecase';
 import { WebhookCommand } from './webhook.command';
 
@@ -84,7 +85,15 @@ export class Webhook {
       await this.verifySignature(command, integration);
     }
 
-    const events = await this.parseEvents(command, integration.providerId, channel);
+    const svixId = command.headers?.['svix-id'];
+    const resendDelivery =
+      integration.providerId === EmailProviderIdEnum.Resend &&
+      isSignatureVerificationEnabled &&
+      integration.configurations?.inboundWebhookSigningKey &&
+      svixId
+        ? { integrationId: integration._id, id: svixId }
+        : undefined;
+    const events = await this.parseEvents(command, integration.providerId, channel, resendDelivery);
 
     this.analyticsService.track('[Webhook] - Provider Webhook events parsed', '', {
       _organization: command.organizationId,
@@ -100,7 +109,8 @@ export class Webhook {
   private async parseEvents(
     command: WebhookCommand,
     providerId: string,
-    channel: ChannelTypeEnum
+    channel: ChannelTypeEnum,
+    resendDelivery?: ExecutionWebhookCommand['resendDelivery']
   ): Promise<IWebhookResult[]> {
     const { body } = command;
     const messageIdentifiers = this.normalizeMessageIdentifiers(this.provider.getMessageId(body));
@@ -108,7 +118,7 @@ export class Webhook {
     const events: IWebhookResult[] = [];
 
     for (const { messageIdentifier, eventIndex } of messageIdentifiers) {
-      const event = await this.parseEvent(messageIdentifier, command, providerId, channel, eventIndex);
+      const event = await this.parseEvent(messageIdentifier, command, providerId, channel, eventIndex, resendDelivery);
 
       if (event === undefined) {
         continue;
@@ -125,7 +135,8 @@ export class Webhook {
     command: WebhookCommand,
     providerId: string,
     channel: ChannelTypeEnum,
-    eventIndex: number
+    eventIndex: number,
+    resendDelivery?: ExecutionWebhookCommand['resendDelivery']
   ): Promise<IWebhookResult | undefined> {
     const message = await this.messageRepository.findOne({
       identifier: messageIdentifier,
@@ -164,6 +175,7 @@ export class Webhook {
       webhook: {
         ...command,
         providerId,
+        resendDelivery,
       },
       webhookEvent: parsedEvent,
       channel,

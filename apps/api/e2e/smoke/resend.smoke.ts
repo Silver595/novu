@@ -320,11 +320,42 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
     const [record] = await deliveryRecords();
     expect(record).to.include({ providerId: 'resend', status: 'Success', webhookStatus: 'delivered' });
 
-    // Capture current behavior. The same valid callback is recorded twice.
-    expect((await callback(body)).status).to.equal(201);
-    expect(await deliveryRecords()).to.have.length(2);
+    const replays = await Promise.all([callback(body), callback(body), callback(body)]);
+    expect(replays.map((response) => response.status)).to.deep.equal([201, 201, 201]);
+    expect(await deliveryRecords()).to.have.length(1);
     expect((await messages.findOne({ ...query, _id: message._id }))?.status).to.equal('sent');
     expect(requests).to.have.length(1);
+
+    const bounceBody = JSON.stringify({ ...JSON.parse(body), type: 'email.bounced' });
+    const bounceId = `msg_${randomUUID()}`;
+    const bounce = () =>
+      fetch(callbackUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'svix-id': bounceId,
+          'svix-timestamp': String(Math.floor(now.getTime() / 1000)),
+          'svix-signature': callbackSigner.sign(bounceId, now, bounceBody),
+        },
+        body: bounceBody,
+      });
+    const bounceRecords = () => details.find({ ...query, _messageId: message._id, webhookStatus: 'bounced' });
+    const database = mongoose.connection.db;
+    if (!database) throw new Error('Test MongoDB is disconnected');
+    const collection = details._model.collection.name;
+    await database.command({ collMod: collection, validator: { webhookStatus: { $ne: 'bounced' } } });
+    try {
+      expect((await bounce()).status).to.equal(500);
+      expect(await bounceRecords()).to.have.length(0);
+    } finally {
+      await database.command({ collMod: collection, validator: {} });
+    }
+    const concurrent = await Promise.all([bounce(), bounce()]);
+    expect(concurrent.map((response) => response.status)).to.deep.equal([201, 201]);
+    const [bounced] = await bounceRecords();
+    expect(await bounceRecords()).to.have.length(1);
+    expect(bounced).to.include({ webhookStatus: 'bounced', status: 'Failed' });
+    expect(await deliveryRecords()).to.have.length(1);
 
     console.info(
       JSON.stringify({
