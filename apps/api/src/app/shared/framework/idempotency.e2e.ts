@@ -1,12 +1,12 @@
 import { CacheService, HttpResponseHeaderKeysEnum } from '@novu/application-generic';
 import { UserSession } from '@novu/testing';
 import { expect } from 'chai';
+import request from 'supertest';
 import {
   IdempotenceTestingResponse,
   IdempotencyBehaviorEnum,
   IdempotencyTestingDto,
 } from '../../testing/dtos/idempotency.dto';
-import { expectSdkExceptionGeneric } from '../helpers/e2e/sdk/e2e-sdk.helper';
 
 const DOCS_LINK = 'https://docs.novu.co/additional-resources/idempotency';
 // @ts-ignore
@@ -30,18 +30,23 @@ describe('Idempotency Test', async () => {
   const path = '/v1/health-check/test-idempotency';
   let cacheService: CacheService | null = null;
 
-  async function testIdempotencyPost(
-    idempotencyTestingDto: IdempotencyTestingDto,
-    key: string
-  ): Promise<{ body: IdempotenceTestingResponse; headers: Record<string, string> }> {
-    const { body, headers } = await session.testAgent
+  function postIdempotency(idempotencyTestingDto: IdempotencyTestingDto, key: string) {
+    return session.testAgent
       .post(path)
       .set(HttpResponseHeaderKeysEnum.IDEMPOTENCY_KEY, key)
       .set('authorization', `ApiKey ${session.apiKey}`)
       .send(idempotencyTestingDto);
+  }
+
+  async function testIdempotencyPost(
+    idempotencyTestingDto: IdempotencyTestingDto,
+    key: string
+  ): Promise<{ body: IdempotenceTestingResponse; headers: Record<string, string> }> {
+    const { body, headers } = await postIdempotency(idempotencyTestingDto, key).expect(201);
 
     return { body: body.data, headers };
   }
+
   async function testIdempotencyGet(
     key: string
   ): Promise<{ body: IdempotenceTestingResponse; headers: Record<string, string> }> {
@@ -129,8 +134,8 @@ describe('Idempotency Test', async () => {
   it('should return UnprocessableEntity when different body is sent for same key', async () => {
     const key = '5';
     await testIdempotencyPost(IDEMPOTENCE_IMMEDIATE_RESPONSE, key);
-    const { error } = await expectSdkExceptionGeneric(() => testIdempotencyPost(IDEMPOTENCE_IMMEDIATE_EXCEPTION, key));
-    expect(error?.statusCode).to.eq(422);
+    const { body } = await postIdempotency(IDEMPOTENCE_IMMEDIATE_EXCEPTION, key).expect(422);
+    expect(body.statusCode).to.eq(422);
   });
   it('should return non cached response for unique requests', async () => {
     const key = '6';
@@ -149,22 +154,19 @@ describe('Idempotency Test', async () => {
   });
   it('should return cached error response for duplicate requests', async () => {
     const key = '9';
-    const { error } = await expectSdkExceptionGeneric(() => testIdempotencyPost(IDEMPOTENCE_IMMEDIATE_EXCEPTION, key));
-    const { error: error2 } = await expectSdkExceptionGeneric(() =>
-      testIdempotencyPost(IDEMPOTENCE_IMMEDIATE_EXCEPTION, key)
-    );
-    expect(error?.message).to.eq(error2?.message);
-    expect(error?.statusCode).to.eq(error2?.statusCode);
-    expect(error2?.statusCode).to.not.eq(503);
+    const first = await postIdempotency(IDEMPOTENCE_IMMEDIATE_EXCEPTION, key).expect(500);
+    const replay = await postIdempotency(IDEMPOTENCE_IMMEDIATE_EXCEPTION, key).expect(500);
+    expect(replay.body.message).to.eq(first.body.message);
+    expect(replay.headers[idempotancyReplayKey]).to.eq('true');
   });
   it('should return 400 when key bigger than allowed limit', async () => {
     const key = Array.from({ length: 256 })
       .fill(0)
       .map((i) => i)
       .join('');
-    const { error } = await expectSdkExceptionGeneric(() => testIdempotencyPost(IDEMPOTENCE_IMMEDIATE_EXCEPTION, key));
-    expect(error?.statusCode).to.eq(400);
-    expect(error?.message).to.include(`has exceeded`);
+    const { body } = await postIdempotency(IDEMPOTENCE_IMMEDIATE_EXCEPTION, key).expect(400);
+    expect(body.statusCode).to.eq(400);
+    expect(body.message).to.include('has exceeded');
   });
 
   describe('Allowed Authentication Security Schemes', () => {
@@ -180,10 +182,14 @@ describe('Idempotency Test', async () => {
       expect(headers[idempotancyKey]).to.exist;
     });
 
-    it('should NOT set rate limit headers when NO authorization header is present', async () => {
-      const key = '10';
-      const { headers } = await testIdempotencyPost(IDEMPOTENCE_IMMEDIATE_RESPONSE, key);
+    it('should reject a request without an authorization header and omit idempotency headers', async () => {
+      const { headers } = await request(session.testServer.getHttpServer())
+        .post(path)
+        .set(HttpResponseHeaderKeysEnum.IDEMPOTENCY_KEY, '10')
+        .send(IDEMPOTENCE_IMMEDIATE_RESPONSE)
+        .expect(401);
       expect(headers[idempotancyKey]).not.to.exist;
+      expect(headers[idempotancyReplayKey]).not.to.exist;
     });
   });
 });
