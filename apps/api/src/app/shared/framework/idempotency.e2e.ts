@@ -1,5 +1,5 @@
 import { CacheService, HttpResponseHeaderKeysEnum } from '@novu/application-generic';
-import { UserSession } from '@novu/testing';
+import { testServer, UserSession } from '@novu/testing';
 import { expect } from 'chai';
 import request from 'supertest';
 import {
@@ -183,7 +183,7 @@ describe('Idempotency Test', async () => {
     });
 
     it('should reject a request without an authorization header and omit idempotency headers', async () => {
-      const { headers } = await request(session.testServer.getHttpServer())
+      const { headers } = await request(testServer.getHttpServer())
         .post(path)
         .set(HttpResponseHeaderKeysEnum.IDEMPOTENCY_KEY, '10')
         .send(IDEMPOTENCE_IMMEDIATE_RESPONSE)
