@@ -15,8 +15,11 @@ describe('SubscriberJobBound', () => {
     steps?: Array<{ template?: { type?: string } }>;
     integrations?: Array<{ providerId: string; channel: string; primary?: boolean }>;
   }) {
-    const createNotificationJobs = { execute: sinon.stub().resolves([]) };
-    const storeSubscriberJobs = { execute: sinon.stub().resolves() };
+    const createNotificationJobs = {
+      execute: sinon.stub().resolves([]),
+      findExisting: sinon.stub().resolves(null),
+    };
+    const storeSubscriberJobs = { execute: sinon.stub().resolves(), resume: sinon.stub().resolves(false) };
     const createOrUpdateSubscriberUsecase = {
       execute: sinon.stub().resolves({ _id: SUBSCRIBER_ID, subscriberId: 'external-subscriber-1' }),
     };

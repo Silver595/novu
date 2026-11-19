@@ -179,6 +179,15 @@ export class SubscriberJobBound {
       return;
     }
 
+    const existingNotification = await this.createNotificationJobs.findExisting({
+      _environmentId: environmentId,
+      _organizationId: organizationId,
+      _templateId: template._id,
+      _subscriberId: subscriberProcessed._id,
+      transactionId: command.transactionId,
+    });
+    if (await this.storeSubscriberJobs.resume(existingNotification)) return;
+
     if (topics && topics.length > 0) {
       const evaluatedTopics = await this.evaluateTopicPreferences(command, topics, template._id, subscriberProcessed);
 
@@ -244,7 +253,8 @@ export class SubscriberJobBound {
     }
 
     const notificationJobs = await this.createNotificationJobs.execute(
-      CreateNotificationJobsCommand.create(createNotificationJobsCommand)
+      CreateNotificationJobsCommand.create(createNotificationJobsCommand),
+      existingNotification
     );
 
     await this.storeSubscriberJobs.execute(

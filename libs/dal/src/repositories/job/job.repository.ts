@@ -9,7 +9,7 @@ import {
 import { sub } from 'date-fns';
 import { ProjectionType } from 'mongoose';
 import { DalException } from '../../shared';
-import type { EnforceEnvOrOrgIds } from '../../types';
+import { type EnforceEnvOrOrgIds, isDuplicateKeyError } from '../../types';
 import { BaseRepository } from '../base-repository';
 import { EnvironmentEntity } from '../environment';
 import { NotificationEntity } from '../notification';
@@ -47,24 +47,81 @@ export class JobRepository extends BaseRepository<JobDBModel, JobEntity, Enforce
   }
 
   public async storeJobs(jobs: Omit<JobEntity, '_id' | 'createdAt' | 'updatedAt'>[]): Promise<JobEntity[]> {
-    const created: InstanceType<typeof this.MongooseModel>[] = [];
-    for (let index = 0; index < jobs.length; index += 1) {
-      if (index > 0) {
-        jobs[index]._parentId = String(created[index - 1]._id);
-      }
+    const head = jobs[0];
+    if (!head) return [];
 
-      created.push(new this.MongooseModel({ ...jobs[index], createdAt: Date.now() }));
-    }
+    const plan = BaseRepository.stableObjectId(
+      'subscriber-step-plan',
+      ...jobs.map(({ type, step }) => JSON.stringify([type, step._templateId, step.stepId, step.uuid]))
+    );
+    const ids = jobs.map((_, index) =>
+      index === jobs.length - 1
+        ? BaseRepository.stableObjectId('subscriber-step-tail', head._notificationId)
+        : BaseRepository.stableObjectId('subscriber-step', head._notificationId, plan, String(index))
+    );
+    const now = new Date();
+    const writes = jobs.map((job, index) => {
+      const parentId = index > 0 ? ids[index - 1] : undefined;
+      return {
+        updateOne: {
+          filter: {
+            _id: ids[index],
+            _environmentId: job._environmentId,
+            _notificationId: job._notificationId,
+            _parentId: parentId ?? null,
+            type: job.type,
+            'step._templateId': job.step._templateId,
+            'step.stepId': job.step.stepId ?? null,
+            'step.uuid': job.step.uuid ?? null,
+          },
+          update: {
+            $setOnInsert: new this.MongooseModel({
+              ...job,
+              _id: ids[index],
+              _parentId: parentId,
+              createdAt: now,
+              updatedAt: now,
+            }).toObject<JobDBModel>(),
+          },
+          upsert: true,
+          timestamps: false,
+        },
+      };
+    });
 
-    // Mongoose stamps updatedAt on these documents as it inserts them, so map them only afterwards:
-    // callers (e.g. the step_runs_v2 writer) then get the timestamps Mongo stored.
+    // The root is the dispatch barrier. A failed ordered bulk write can leave a
+    // suffix, but a visible root means the entire chain is persisted. The tail
+    // has a fixed ID. Its parent pins the step plan before other jobs are added.
     try {
-      await this.MongooseModel.insertMany(created, { ordered: true });
+      await this.MongooseModel.bulkWrite(writes.reverse(), { ordered: true });
     } catch (error: unknown) {
-      throw new DalException(error instanceof Error ? error.message : 'An unknown error occurred');
+      if (!isDuplicateKeyError(error)) {
+        throw new DalException(error instanceof Error ? error.message : 'An unknown error occurred');
+      }
+      // Concurrent upserts can race at the unique _id. A conflicting step plan
+      // fails again instead of overwriting a different step in the chain.
+      await this.MongooseModel.bulkWrite(writes, { ordered: true });
     }
 
-    return created.map((document) => this.mapEntity(document));
+    const persisted = await this.find({ _environmentId: head._environmentId, _id: { $in: ids } });
+    const byId = new Map(persisted.map((job) => [job._id, job]));
+    return ids.map((id) => {
+      const job = byId.get(id);
+      if (!job) throw new DalException('Persisted subscriber step was not found');
+      return job;
+    });
+  }
+
+  public async claimRootForEnqueue(environmentId: string, jobId: string): Promise<JobEntity | null> {
+    const root = { _environmentId: environmentId, _id: jobId, _parentId: null };
+    const claimed = await this.findOneAndUpdate(
+      { ...root, status: JobStatusEnum.PENDING },
+      { $set: { status: JobStatusEnum.QUEUED, awaitingEnqueue: true } },
+      { new: true }
+    );
+
+    // An earlier dispatcher may have failed before marking the queue write.
+    return claimed ?? this.findOne({ ...root, status: JobStatusEnum.QUEUED, awaitingEnqueue: true });
   }
 
   public async updateStatus(

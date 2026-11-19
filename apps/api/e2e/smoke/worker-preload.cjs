@@ -20,15 +20,43 @@ if (process.send) {
 
 const crashTransactionId = process.env.NOVU_SMOKE_CRASH_TRANSACTION_ID;
 if (crashTransactionId) {
+  const stage = process.env.NOVU_SMOKE_RECOVERY_STAGE;
   const { AddJob } = require('../../../worker/dist/app/workflow/usecases/add-job/add-job.usecase');
-  const execute = AddJob.prototype.execute;
-
-  AddJob.prototype.execute = function pauseBeforeDispatch(command) {
-    if (command.job?.transactionId === crashTransactionId) {
-      process.send({ persistedJobId: command.jobId });
-      return new Promise(() => {});
-    }
-
-    return execute.call(this, command);
+  const pause = (id) => {
+    process.send({ persistedJobId: id });
+    return new Promise(() => {});
   };
+
+  if (stage === 'after-claim') {
+    const queueJob = AddJob.prototype.queueJob;
+    AddJob.prototype.queueJob = function pauseBeforeQueueWrite(params) {
+      if (params.job.transactionId === crashTransactionId && !params.job._parentId) {
+        return pause(params.job._id);
+      }
+      return queueJob.call(this, params);
+    };
+  } else if (stage === 'race') {
+    const { NotificationRepository } = require('../../../worker/node_modules/@novu/dal');
+    const ensure = NotificationRepository.prototype.ensureSubscriberNotification;
+    let arrived = 0;
+    let release;
+    const gate = new Promise((done) => {
+      release = done;
+    });
+    NotificationRepository.prototype.ensureSubscriberNotification = async function waitForCompetitor(identity, data) {
+      if (identity.transactionId === crashTransactionId) {
+        if (++arrived === 2) release();
+        await gate;
+      }
+      return ensure.call(this, identity, data);
+    };
+  } else {
+    const execute = AddJob.prototype.execute;
+    AddJob.prototype.execute = function pauseBeforeDispatch(command) {
+      if (command.job?.transactionId === crashTransactionId) {
+        return pause(command.jobId);
+      }
+      return execute.call(this, command);
+    };
+  }
 }

@@ -32,6 +32,8 @@ export class AddJobCommand extends EnvironmentWithUserCommand {
   @IsDefined()
   job: JobEntity;
 
+  recoverableRoot?: boolean;
+
   notification?: PartialNotificationEntity | null;
 
   controls?: StatelessControls;

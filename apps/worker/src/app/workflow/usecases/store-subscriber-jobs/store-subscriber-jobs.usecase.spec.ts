@@ -1,4 +1,4 @@
-import { StepTypeEnum } from '@novu/shared';
+import { JobStatusEnum, StepTypeEnum } from '@novu/shared';
 import { expect } from 'chai';
 import sinon from 'sinon';
 import { StoreSubscriberJobs } from './store-subscriber-jobs.usecase';
@@ -17,6 +17,7 @@ function buildJobEntity(overrides: Record<string, unknown> = {}) {
     transactionId: 'transaction_1',
     identifier: 'workflow-run-1',
     type: StepTypeEnum.EMAIL,
+    status: JobStatusEnum.PENDING,
     bridge: false,
     controlVariables: {},
     ...overrides,
@@ -176,6 +177,20 @@ describe('StoreSubscriberJobs', () => {
     const [jobs, options] = stepRunV2Writer.writeMany.getCall(0).args;
     expect(jobs).to.deep.equal([job1, job2]);
     expect(options).to.equal(undefined);
+  });
+
+  it('preserves the trace state of a chain that already advanced', async () => {
+    const job = buildJobEntity({ status: JobStatusEnum.COMPLETED });
+    jobRepository.storeJobs.resolves([job]);
+
+    await usecase.execute({
+      environmentId: 'env_1',
+      organizationId: 'org_1',
+      jobs: [job],
+    } as never);
+
+    expect(stepRunRepository.createMany.called).to.equal(false);
+    expect(stepRunV2Writer.writeMany.called).to.equal(false);
   });
 
   it('still calls addJob even with a single stored job', async () => {

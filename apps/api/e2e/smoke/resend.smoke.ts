@@ -5,14 +5,20 @@ import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
+  BullMqService,
+  type IProcessSubscriberDataDto,
+  WorkflowInMemoryProviderService,
+} from '@novu/application-generic';
+import {
   ExecutionDetailsRepository,
   IntegrationRepository,
   JobRepository,
   MessageRepository,
+  mongoose,
   NotificationRepository,
 } from '@novu/dal';
-import { EmailBlockTypeEnum, JobStatusEnum, StepTypeEnum, TriggerTypeEnum } from '@novu/shared';
-import { UserSession } from '@novu/testing';
+import { EmailBlockTypeEnum, JobStatusEnum, JobTopicNameEnum, StepTypeEnum, TriggerTypeEnum } from '@novu/shared';
+import { testServer, UserSession } from '@novu/testing';
 import { expect } from 'chai';
 import { parse } from 'dotenv';
 import { Webhook } from 'svix';
@@ -47,7 +53,7 @@ async function stop(child: ChildProcess | undefined, signal: NodeJS.Signals = 'S
 }
 
 describe('Resend smoke workflow (local HTTP simulation)', function () {
-  this.timeout(100_000);
+  this.timeout(140_000);
 
   const notifications = new NotificationRepository();
   const messages = new MessageRepository();
@@ -83,6 +89,9 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
   let integrationId: string;
   let simulatorUrl: string;
   let callbackSigner: Webhook;
+  let subscriberQueue: ReturnType<BullMqService['createQueue']>;
+  let recoveryDelivery: IProcessSubscriberDataDto;
+  let crashedQueueJobId: string | undefined;
   let webhookUrl: string;
   const transactionQuery = (transactionId: string) => ({
     _environmentId: session.environment._id,
@@ -137,7 +146,11 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
     return `http://127.0.0.1:${port}`;
   }
 
-  const startWorker = (crashTransactionId = '', onMessage?: (message: WorkerCheckpoint) => void) =>
+  const startWorker = (
+    crashTransactionId = '',
+    onMessage?: (message: WorkerCheckpoint) => void,
+    stage: 'before-dispatch' | 'after-claim' | 'race' = 'before-dispatch'
+  ) =>
     startService(
       'worker',
       {
@@ -145,19 +158,25 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
         PORT: '1342',
         RESEND_BASE_URL: simulatorUrl,
         NOVU_SMOKE_CRASH_TRANSACTION_ID: crashTransactionId,
+        NOVU_SMOKE_RECOVERY_STAGE: stage,
         WORKER_DEFAULT_LOCK_DURATION: '3000',
       },
       onMessage
     );
 
-  async function trigger(transactionId: string, title: string) {
+  async function trigger(
+    transactionId: string,
+    title: string,
+    targets = [{ subscriberId: 'interview-smoke', email: recipient }],
+    workflowName = workflow
+  ) {
     const { body } = await session.testAgent
       .post('/v1/events/trigger')
       .set('Authorization', `ApiKey ${session.apiKey}`)
       .send({
-        name: workflow,
+        name: workflowName,
         transactionId,
-        to: { subscriberId: 'interview-smoke', email: recipient },
+        to: targets,
         payload: { title },
       })
       .expect(201);
@@ -176,6 +195,8 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
     if (!address || typeof address === 'string') throw new Error('Missing simulator address');
     simulatorUrl = `http://127.0.0.1:${address.port}`;
 
+    const provider = testServer.getService(WorkflowInMemoryProviderService);
+    subscriberQueue = new BullMqService(provider).createQueue(JobTopicNameEnum.PROCESS_SUBSCRIBER, {});
     session = new UserSession();
     await session.initialize();
     // Remove fixture email integrations before enabling real adapter I/O in the worker.
@@ -221,6 +242,18 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
 
   after(async () => {
     await Promise.all([stop(worker), stop(webhook)]);
+    const jobId = crashedQueueJobId;
+    if (subscriberQueue && jobId) {
+      await waitFor('test subscriber job removal after its lock expires', async () => {
+        const entry = await subscriberQueue.getJob(jobId);
+        if (!entry) return true;
+        return entry
+          .remove()
+          .then(() => true)
+          .catch(() => undefined);
+      });
+    }
+    await subscriberQueue?.close();
     simulator.close();
   });
 
@@ -304,7 +337,24 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
     );
   });
 
-  it('observes redelivery after a worker is killed between MongoDB step storage and dispatch', async () => {
+  async function replay(delivery: IProcessSubscriberDataDto, times: number) {
+    const entries = await subscriberQueue.addBulk(
+      Array.from({ length: times }, () => ({
+        name: 'replayed-subscriber',
+        data: delivery,
+        opts: { removeOnComplete: false, removeOnFail: false },
+      }))
+    );
+
+    await waitFor('subscriber replays to finish', async () => {
+      const states = await Promise.all(entries.map((entry) => entry.getState()));
+      if (states.includes('failed')) throw new Error('A subscriber replay failed');
+      return states.every((state) => state === 'completed') ? true : undefined;
+    });
+    return entries.map((entry) => entry.id);
+  }
+
+  it('recovers the original chain across a pre-dispatch crash and a crash during recovery', async () => {
     await stop(worker);
     const transactionId = randomUUID();
     const query = transactionQuery(transactionId);
@@ -314,46 +364,156 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
     });
     await trigger(transactionId, 'Recovery interview');
     const crashedJobId = await waitFor('pre-dispatch checkpoint', async () => persistedJobId);
-    const first = await jobs.findOne({ ...query, _id: crashedJobId });
-    if (!first) throw new Error('Pre-dispatch job is missing from MongoDB');
-    expect(first.status).to.equal(JobStatusEnum.PENDING);
+    const active = (await subscriberQueue.getActive()).find((entry) => entry.data.transactionId === transactionId);
+    if (!active) throw new Error('Original subscriber job is missing from BullMQ');
+    recoveryDelivery = active.data;
+    crashedQueueJobId = active.id;
+    const originalJobs = await jobs.find(query);
+    const original = originalJobs.find((job) => job._id === crashedJobId);
+    if (!original) throw new Error('Pre-dispatch job is missing from MongoDB');
+    expect(original.status).to.equal(JobStatusEnum.PENDING);
     expect(await notifications.find(query)).to.have.length(1);
     expect(await messages.find(query)).to.have.length(0);
-    expect(requests.filter((request) => request.subject.includes('Recovery interview'))).to.have.length(0);
     await stop(worker, 'SIGKILL');
-    await startWorker();
 
-    const recovered = await waitFor(
-      'delivery following BullMQ stalled-job recovery',
-      async () => {
-        const row = await messages.findOne({ ...query, channel: 'email' });
-        return row?.identifier ? row : undefined;
+    persistedJobId = undefined;
+    await startWorker(
+      transactionId,
+      (message) => {
+        persistedJobId = message.persistedJobId;
       },
-      75_000
+      'after-claim'
     );
-    await waitFor(
-      'recovered email step completion',
-      async () =>
-        (await jobs.findOne({ ...query, _id: recovered._jobId, status: JobStatusEnum.COMPLETED })) ?? undefined
-    );
-    const attempts = await notifications.find(query);
-    const storedJobs = await jobs.find(query);
-    expect(attempts).to.have.length(2);
-    expect(recovered._notificationId).not.to.equal(first._notificationId);
-    expect(storedJobs.find((job) => job._id === crashedJobId)?.status).to.equal(JobStatusEnum.PENDING);
-    expect(await messages.find(query)).to.have.length(1);
+    const claimedId = await waitFor('stalled redelivery to claim the same root', async () => persistedJobId, 75_000);
+    expect(claimedId).to.equal(crashedJobId);
+    const recoveryJob = (await subscriberQueue.getActive()).find((entry) => entry.id === active.id);
+    expect(recoveryJob?.id).to.equal(active.id);
+    expect(await jobs.findOne({ ...query, _id: crashedJobId })).to.include({
+      status: JobStatusEnum.QUEUED,
+      awaitingEnqueue: true,
+    });
+    expect(await messages.find(query)).to.have.length(0);
+    await stop(worker, 'SIGKILL');
+
+    await startWorker();
+    const replayIds = await replay(recoveryDelivery, 3);
+    const recovered = await waitFor('recovered email', async () => {
+      const row = await messages.findOne({ ...query, channel: 'email' });
+      return row?.identifier ? row : undefined;
+    });
+    await waitFor('original jobs to complete', async () => {
+      const rows = await jobs.find(query);
+      return rows.length === originalJobs.length && rows.every((row) => row.status === JobStatusEnum.COMPLETED)
+        ? rows
+        : undefined;
+    });
+    await replay(recoveryDelivery, 1);
+    const finalJobs = await jobs.find(query);
     const providerRequests = requests.filter((request) => request.subject === 'Scheduled: Recovery interview');
+    const deliveredMessages = await messages.find(query);
+    const attempts = await details.find({ ...query, _messageId: recovered._id, detail: 'Message sent' });
+    expect((await notifications.find(query)).map(({ _id }) => _id)).to.deep.equal([original._notificationId]);
+    expect(finalJobs.map(({ _id }) => _id)).to.have.members(originalJobs.map(({ _id }) => _id));
+    expect(deliveredMessages).to.have.length(1);
+    expect(attempts).to.have.length(1);
     expect(providerRequests).to.have.length(1);
     expect(recovered.identifier).to.equal(providerRequests[0].id);
     console.info(
       JSON.stringify({
-        transactionId,
-        crashedJobId,
-        notificationCount: attempts.length,
-        recoveredMessageId: recovered._id,
-        jobs: storedJobs.map((job) => ({ id: job._id, status: job.status })),
-        providerRequests: providerRequests.length,
+        ...query,
+        subscriberId: original.subscriberId,
+        internalSubscriberId: original._subscriberId,
+        subscriberQueueJobId: active.id,
+        replayIds,
+        notificationId: original._notificationId,
+        jobs: finalJobs.map(({ _id, status }) => ({ id: _id, status })),
+        messageId: recovered._id,
+        providerId: recovered.identifier,
+        deliveryAttemptId: attempts[0]._id,
       })
     );
+  });
+
+  it('atomically converges two concurrent first deliveries of the same subscriber intent', async () => {
+    await stop(worker);
+    const transactionId = randomUUID();
+    await startWorker(transactionId, undefined, 'race');
+    const transaction = { ...recoveryDelivery, transactionId, payload: { title: 'Concurrent interview' } };
+    await replay(transaction, 2);
+    const query = transactionQuery(transactionId);
+    await waitFor('concurrent delivery to complete', async () => {
+      const rows = await jobs.find(query);
+      return rows.length === 2 && rows.every((row) => row.status === JobStatusEnum.COMPLETED) ? true : undefined;
+    });
+    expect(await notifications.find(query)).to.have.length(1);
+    expect(await messages.find(query)).to.have.length(1);
+    expect(requests.filter((request) => request.subject === 'Scheduled: Concurrent interview')).to.have.length(1);
+  });
+
+  it('fills a partially written job chain without replacing its tail', async () => {
+    const transactionId = randomUUID();
+    const transaction = { ...recoveryDelivery, transactionId, payload: { title: 'Partial plan interview' } };
+    const query = transactionQuery(transactionId);
+    const database = mongoose.connection.db;
+    if (!database) throw new Error('Test MongoDB is disconnected');
+    const collection = jobs._model.collection.name;
+    const validator = { $or: [{ transactionId: { $ne: transactionId } }, { _parentId: { $type: 'objectId' } }] };
+    await database.command({ collMod: collection, validator });
+    try {
+      const entry = await subscriberQueue.add('rejected-root', transaction, { removeOnFail: false });
+      await waitFor('MongoDB to reject the root write', async () =>
+        (await entry.getState()) === 'failed' ? true : undefined
+      );
+    } finally {
+      await database.command({ collMod: collection, validator: {} });
+    }
+    const suffix = await jobs.find(query);
+    expect(suffix).to.have.length(1);
+    expect(suffix[0]).to.include({ type: StepTypeEnum.EMAIL, status: JobStatusEnum.PENDING });
+    expect(await notifications.find(query)).to.have.length(1);
+    expect(await messages.find(query)).to.have.length(0);
+
+    await replay(transaction, 1);
+    await waitFor('repaired chain to complete', async () => {
+      const rows = await jobs.find(query);
+      return rows.length === 2 && rows.every((row) => row.status === JobStatusEnum.COMPLETED) ? rows : undefined;
+    });
+    expect((await jobs.findOne({ ...query, _id: suffix[0]._id }))?.status).to.equal(JobStatusEnum.COMPLETED);
+    expect(await notifications.find(query)).to.have.length(1);
+    expect(await messages.find(query)).to.have.length(1);
+    expect(requests.filter((request) => request.subject === 'Scheduled: Partial plan interview')).to.have.length(1);
+  });
+
+  it('preserves step order and separate recipients sharing a transaction', async () => {
+    const multistep = 'interview-scheduled-multistep';
+    await session.createTemplate({
+      name: multistep,
+      triggers: [{ identifier: multistep, type: TriggerTypeEnum.EVENT, variables: [{ name: 'title' }] }],
+      steps: ['First', 'Second'].map((label) => ({
+        type: StepTypeEnum.EMAIL,
+        subject: `${label}: {{title}}`,
+        content: [{ type: EmailBlockTypeEnum.TEXT, content: label }],
+      })),
+    });
+    const transactionId = randomUUID();
+    const targets = ['one', 'two'].map((id) => ({ subscriberId: id, email: `${id}@example.invalid` }));
+    await trigger(transactionId, 'Multi-step interview', targets, multistep);
+    const query = transactionQuery(transactionId);
+    const persisted = await waitFor('both three-step chains to complete', async () => {
+      const rows = await jobs.find(query);
+      return rows.length === 6 && rows.every((row) => row.status === JobStatusEnum.COMPLETED) ? rows : undefined;
+    });
+    expect(await notifications.find(query)).to.have.length(2);
+    expect(await messages.find(query)).to.have.length(4);
+    for (const target of targets) {
+      const chain = persisted.filter((row) => row.subscriberId === target.subscriberId);
+      expect(chain).to.have.length(3);
+      const root = chain.find((row) => !row._parentId);
+      const first = chain.find((row) => row._parentId === root?._id);
+      const second = chain.find((row) => row._parentId === first?._id);
+      expect([root?.type, first?.type, second?.type]).to.deep.equal(['trigger', 'email', 'email']);
+      const subjects = requests.filter((row) => [row.to].flat().includes(target.email)).map(({ subject }) => subject);
+      expect(subjects).to.deep.equal(['First: Multi-step interview', 'Second: Multi-step interview']);
+    }
   });
 });

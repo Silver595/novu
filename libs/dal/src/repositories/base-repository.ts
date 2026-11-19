@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { DirectionEnum } from '@novu/shared';
 import { ClassConstructor } from 'class-transformer';
 import {
@@ -14,6 +15,7 @@ import {
   UpdateQuery,
 } from 'mongoose';
 import { DalException } from '../shared';
+import { isDuplicateKeyError } from '../types/error.enum';
 import {
   buildAdjacentPageQuery,
   buildCursorSort,
@@ -52,6 +54,13 @@ export class BaseRepository<T_DBModel, T_MappedEntity, T_Enforcement> {
 
   public static createObjectId() {
     return new Types.ObjectId().toString();
+  }
+
+  public static stableObjectId(namespace: string, ...parts: string[]) {
+    return createHash('sha256')
+      .update(JSON.stringify([namespace, ...parts]))
+      .digest('hex')
+      .slice(0, 24);
   }
 
   public static isInternalId(id: string) {
@@ -202,6 +211,32 @@ export class BaseRepository<T_DBModel, T_MappedEntity, T_Enforcement> {
     if (!data) return null;
 
     return this.mapEntity(data.toObject());
+  }
+
+  /** The query must include a unique key. An existing record is left unchanged. */
+  async findOrInsert(query: FilterQuery<T_DBModel> & T_Enforcement, data: Partial<T_MappedEntity>) {
+    try {
+      const now = new Date();
+      const result = await this.MongooseModel.findOneAndUpdate(
+        query,
+        { $setOnInsert: { createdAt: now, updatedAt: now, ...data } },
+        { upsert: true, new: true, includeResultMetadata: true, timestamps: false }
+      );
+      if (result.value) {
+        return {
+          entity: this.mapEntity(result.value.toObject()),
+          inserted: result.lastErrorObject?.updatedExisting === false,
+        };
+      }
+    } catch (error) {
+      if (!isDuplicateKeyError(error)) throw error;
+
+      const existing = await this.findOne(query);
+      if (existing) return { entity: existing, inserted: false };
+      throw error;
+    }
+
+    throw new DalException('Insert or lookup did not return a document');
   }
 
   async delete(

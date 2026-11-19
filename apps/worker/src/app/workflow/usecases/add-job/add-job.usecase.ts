@@ -127,7 +127,13 @@ export class AddJob {
   @LogDecorator()
   public async execute(command: AddJobCommand): Promise<AddJobResult> {
     this.logger.trace('Getting Job');
-    const { job } = command;
+    let { job } = command;
+    if (command.recoverableRoot) {
+      const claimed = await this.jobRepository.claimRootForEnqueue(command.environmentId, command.jobId);
+      if (!claimed) return { workflowStatus: null, deliveryLifecycleStatus: null };
+      job = claimed;
+      command = { ...command, job };
+    }
     this.logger.debug(`Job contents for job ${job._id}`, job);
 
     if (!job) {
@@ -444,7 +450,9 @@ export class AddJob {
     const { job } = command;
 
     this.logger.trace(`Updating status to queued for job ${job._id}`);
-    const queuedJob = await this.jobRepository.updateStatus(command.environmentId, job._id, JobStatusEnum.QUEUED);
+    const queuedJob = command.recoverableRoot
+      ? job
+      : await this.jobRepository.updateStatus(command.environmentId, job._id, JobStatusEnum.QUEUED);
 
     await this.stepRunRepository.create(job, {
       status: JobStatusEnum.QUEUED,

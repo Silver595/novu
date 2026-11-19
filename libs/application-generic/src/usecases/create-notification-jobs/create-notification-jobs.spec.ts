@@ -28,12 +28,15 @@ describe('CreateNotificationJobs', () => {
 
   function buildUsecase() {
     const notificationRepository = {
-      create: vi.fn().mockResolvedValue({
-        _id: NOTIFICATION_ID,
-        _templateId: WORKFLOW_ID,
-        _subscriberId: SUBSCRIBER_ID,
-        transactionId: 'tx_1',
-        channels: [],
+      ensureSubscriberNotification: vi.fn().mockResolvedValue({
+        inserted: true,
+        entity: {
+          _id: NOTIFICATION_ID,
+          _templateId: WORKFLOW_ID,
+          _subscriberId: SUBSCRIBER_ID,
+          transactionId: 'tx_1',
+          channels: [],
+        },
       }),
     };
     const workflowRunRepository = { create: vi.fn() };
@@ -127,7 +130,7 @@ describe('CreateNotificationJobs', () => {
     await expect(usecase.execute(command)).rejects.toThrow(
       `No active steps with templates found for workflow ${WORKFLOW_ID}`
     );
-    expect(notificationRepository.create).not.toHaveBeenCalled();
+    expect(notificationRepository.ensureSubscriberNotification).not.toHaveBeenCalled();
   });
 
   it('should never reintroduce steps with missing templates through the digest path', async () => {
@@ -291,7 +294,8 @@ describe('CreateNotificationJobs', () => {
 
       const jobs = await usecase.execute(buildCommandWithOverrides());
 
-      expect(notificationRepository.create).toHaveBeenCalledWith(
+      expect(notificationRepository.ensureSubscriberNotification).toHaveBeenCalledWith(
+        expect.any(Object),
         expect.objectContaining({ overrides: triggerOverrides })
       );
       expect(jobs.map((job) => job.type)).toEqual([StepTypeEnum.TRIGGER, StepTypeEnum.EMAIL]);
@@ -304,7 +308,8 @@ describe('CreateNotificationJobs', () => {
 
       const jobs = await usecase.execute(buildCommandWithOverrides());
 
-      expect(notificationRepository.create).toHaveBeenCalledWith(
+      expect(notificationRepository.ensureSubscriberNotification).toHaveBeenCalledWith(
+        expect.any(Object),
         expect.objectContaining({ overrides: triggerOverrides })
       );
       expect(jobs.map((job) => job.type)).toEqual([StepTypeEnum.TRIGGER, StepTypeEnum.EMAIL]);
@@ -319,7 +324,7 @@ describe('CreateNotificationJobs', () => {
 
         await usecase.execute(buildCommand([buildEmailStep()]));
 
-        const [notificationInput] = notificationRepository.create.mock.calls[0];
+        const [, notificationInput] = notificationRepository.ensureSubscriberNotification.mock.calls[0];
         expect(Object.prototype.hasOwnProperty.call(notificationInput, 'overrides')).toBe(false);
       }
     );

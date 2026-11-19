@@ -5,6 +5,7 @@ import {
   NotificationEntity,
   NotificationRepository,
   NotificationStepEntity,
+  type SubscriberNotificationIdentity,
 } from '@novu/dal';
 import {
   DeliveryLifecycleStatusEnum,
@@ -53,8 +54,15 @@ export class CreateNotificationJobs {
     this.logger.setContext(this.constructor.name);
   }
 
+  public findExisting(identity: SubscriberNotificationIdentity) {
+    return this.notificationRepository.findSubscriberNotification(identity);
+  }
+
   @InstrumentUsecase()
-  public async execute(command: CreateNotificationJobsCommand): Promise<NotificationJob[]> {
+  public async execute(
+    command: CreateNotificationJobsCommand,
+    existingNotification?: NotificationEntity | null
+  ): Promise<NotificationJob[]> {
     const activeSteps = this.filterActiveStepsWithTemplates(command.template.steps, command.template._id);
 
     const channels = activeSteps
@@ -68,7 +76,7 @@ export class CreateNotificationJobs {
         return list;
       }, []);
 
-    const notification = await this.createNotification(command, channels);
+    const notification = existingNotification ?? (await this.createNotification(command, channels));
 
     if (!notification) {
       const message = 'Notification could not be created';
@@ -139,25 +147,31 @@ export class CreateNotificationJobs {
   private async createNotification(command: CreateNotificationJobsCommand, channels: StepTypeEnum[]) {
     const hasOverrides = !!command.overrides && Object.keys(command.overrides).length > 0;
 
-    const notification = await this.notificationRepository.create({
+    const identity = {
       _environmentId: command.environmentId,
       _organizationId: command.organizationId,
       _subscriberId: command.subscriber._id,
       _templateId: command.template._id,
-      topics: command.topics ?? [],
       transactionId: command.transactionId,
-      to: command.to,
-      payload: command.payload,
-      ...(hasOverrides && { overrides: command.overrides }),
-      channels,
-      controls: command.controls,
-      tags: command.template.tags,
-      severity: command.severity,
-      critical: command.critical,
-      contextKeys: command.contextKeys,
-    });
+    };
+    const { entity: notification, inserted } = await this.notificationRepository.ensureSubscriberNotification(
+      identity,
+      {
+        ...identity,
+        topics: command.topics ?? [],
+        to: command.to,
+        payload: command.payload,
+        ...(hasOverrides && { overrides: command.overrides }),
+        channels,
+        controls: command.controls,
+        tags: command.template.tags,
+        severity: command.severity,
+        critical: command.critical,
+        contextKeys: command.contextKeys,
+      }
+    );
 
-    await this.createWorkflowRun(notification, command);
+    if (inserted) await this.createWorkflowRun(notification, command);
 
     return notification;
   }

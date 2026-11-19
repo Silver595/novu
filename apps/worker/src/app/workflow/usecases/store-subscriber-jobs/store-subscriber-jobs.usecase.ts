@@ -8,7 +8,7 @@ import {
   StepRunV2Writer,
   TraceLogRepository,
 } from '@novu/application-generic';
-import { DalException, JobEntity, JobRepository, JobStatusEnum } from '@novu/dal';
+import { DalException, JobEntity, JobRepository, JobStatusEnum, NotificationEntity } from '@novu/dal';
 import { PlatformException } from '../../../shared/utils';
 import { AddJob } from '../add-job';
 import { StoreSubscriberJobsCommand } from './store-subscriber-jobs.command';
@@ -24,6 +24,20 @@ export class StoreSubscriberJobs {
     private stepRunV2Writer: StepRunV2Writer
   ) {}
 
+  async resume(notification: NotificationEntity | null): Promise<boolean> {
+    if (!notification) return false;
+
+    const root = await this.jobRepository.findOne({
+      _environmentId: notification._environmentId,
+      _notificationId: notification._id,
+      _parentId: null,
+    });
+    if (!root) return false;
+
+    await this.dispatchRoot(root);
+    return true;
+  }
+
   @InstrumentUsecase()
   async execute(command: StoreSubscriberJobsCommand) {
     let storedJobs;
@@ -36,21 +50,23 @@ export class StoreSubscriberJobs {
       throw e;
     }
 
-    await this.stepRunRepository.createMany(storedJobs, { status: JobStatusEnum.QUEUED });
-    this.stepRunV2Writer.writeMany(storedJobs);
+    const pendingJobs = storedJobs.filter((job) => job.status === JobStatusEnum.PENDING);
+    if (pendingJobs.length > 0) {
+      await this.stepRunRepository.createMany(pendingJobs, { status: JobStatusEnum.QUEUED });
+      this.stepRunV2Writer.writeMany(pendingJobs);
+      await this.emitStepCreatedTraces(pendingJobs);
+    }
+    if (storedJobs[0]) await this.dispatchRoot(storedJobs[0]);
+  }
 
-    await this.emitStepCreatedTraces(storedJobs);
-
-    const firstJob = storedJobs[0];
-
+  private async dispatchRoot(firstJob: JobEntity) {
     const addJobCommand = {
       userId: firstJob._userId,
       environmentId: firstJob._environmentId,
       organizationId: firstJob._organizationId,
       jobId: firstJob._id,
       job: firstJob,
-      bridge: firstJob.bridge,
-      controlVariables: firstJob.controlVariables,
+      recoverableRoot: true,
     };
 
     await this.addJob.execute(addJobCommand);

@@ -41,6 +41,11 @@ export interface NotificationFeedFilters {
   contextKeys?: string[];
 }
 
+export type SubscriberNotificationIdentity = Pick<
+  NotificationEntity,
+  '_environmentId' | '_organizationId' | '_templateId' | '_subscriberId' | 'transactionId'
+>;
+
 export class NotificationRepository extends BaseRepository<
   NotificationDBModel,
   NotificationEntity,
@@ -48,6 +53,24 @@ export class NotificationRepository extends BaseRepository<
 > {
   constructor() {
     super(Notification, NotificationEntity);
+  }
+
+  public findSubscriberNotification(identity: SubscriberNotificationIdentity) {
+    return this.findOne(identity, undefined, { query: { sort: { createdAt: -1, _id: -1 } } });
+  }
+
+  public ensureSubscriberNotification(identity: SubscriberNotificationIdentity, data: Partial<NotificationEntity>) {
+    const { _environmentId, _organizationId, _templateId, _subscriberId, transactionId } = identity;
+    const _id = BaseRepository.stableObjectId(
+      'subscriber-notification',
+      _environmentId,
+      _organizationId,
+      _templateId,
+      _subscriberId,
+      transactionId
+    );
+
+    return this.findOrInsert({ ...identity, _id }, data);
   }
 
   async findBySubscriberId(environmentId: string, subscriberId: string) {
