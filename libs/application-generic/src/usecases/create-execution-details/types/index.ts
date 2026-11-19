@@ -56,6 +56,8 @@ export enum DetailEnum {
   STEP_PROCESSED = 'Step processed',
   PROVIDER_MISSING = 'Provider is missing or not configured',
   PROVIDER_ERROR = 'Unexpected provider error',
+  RESEND_OUTCOME_UNCERTAIN = 'Resend outcome uncertain',
+  RESEND_REJECTED = 'Resend rejected the request',
   START_DIGESTING = 'Start digesting',
   STEP_COMPLETED = 'Step completed',
   PROCESSING_STEP_FILTER = 'Processing step filter',

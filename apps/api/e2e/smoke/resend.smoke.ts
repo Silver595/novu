@@ -1,12 +1,13 @@
 import { type ChildProcess, fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { createServer } from 'node:http';
+import { createServer, type ServerResponse } from 'node:http';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   BullMqService,
   type IProcessSubscriberDataDto,
+  StandardQueueService,
   WorkflowInMemoryProviderService,
 } from '@novu/application-generic';
 import {
@@ -61,6 +62,11 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
   const details = new ExecutionDetailsRepository();
   const requests: Array<{ from: string; to: string | string[]; subject: string; html: string; id: string }> = [];
 
+  const attempts: Array<{ subject: string; key?: string }> = [];
+  const byKey = new Map<string, { raw: string; id: string }>();
+  const slowReplays = new Set<string>();
+  const faults = new Map<string, 'timeout' | '500' | '429' | '409'>();
+
   const simulator = createServer(async (request, response) => {
     if (request.method !== 'POST' || request.url !== '/emails') {
       response.writeHead(404).end();
@@ -74,18 +80,45 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk);
     try {
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      const id = randomUUID();
-      requests.push({ ...body, id });
-      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id }));
+      const header = request.headers['idempotency-key'];
+      respondToSend(response, Buffer.concat(chunks).toString('utf8'), typeof header === 'string' ? header : undefined);
     } catch {
       response.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ message: 'bad mock body' }));
     }
   });
 
+  function respondToSend(response: ServerResponse, raw: string, key?: string) {
+    const body = JSON.parse(raw);
+    attempts.push({ subject: body.subject, key });
+    const existing = key && byKey.get(key);
+    const fault = faults.get(body.subject);
+    faults.delete(body.subject);
+    response.setHeader('content-type', 'application/json');
+    if (fault === '409' || (existing && existing.raw !== raw)) {
+      response.writeHead(409).end(JSON.stringify({ name: 'invalid_idempotent_request', message: 'body conflict' }));
+      return;
+    }
+    if (existing) {
+      const reply = () => response.writeHead(200).end(JSON.stringify({ id: existing.id }));
+      if (slowReplays.has(body.subject)) setTimeout(reply, 750);
+      else reply();
+      return;
+    }
+    if (fault === '429' || fault === '500') {
+      const name = fault === '429' ? 'rate_limit_exceeded' : 'internal_server_error';
+      response.writeHead(Number(fault)).end(JSON.stringify({ name, message: name }));
+      return;
+    }
+    const id = randomUUID();
+    if (key) byKey.set(key, { raw, id });
+    requests.push({ ...body, id });
+    if (fault !== 'timeout') response.writeHead(200).end(JSON.stringify({ id }));
+  }
+
   let session: UserSession;
   let worker: ChildProcess | undefined;
   let webhook: ChildProcess | undefined;
+  let competingWorker: ChildProcess | undefined;
   let integrationId: string;
   let simulatorUrl: string;
   let callbackSigner: Webhook;
@@ -149,7 +182,8 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
   const startWorker = (
     crashTransactionId = '',
     onMessage?: (message: WorkerCheckpoint) => void,
-    stage: 'before-dispatch' | 'after-claim' | 'race' = 'before-dispatch'
+    stage: 'before-dispatch' | 'after-claim' | 'race' | 'after-provider' = 'before-dispatch',
+    probeJobId = ''
   ) =>
     startService(
       'worker',
@@ -160,6 +194,8 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
         NOVU_SMOKE_CRASH_TRANSACTION_ID: crashTransactionId,
         NOVU_SMOKE_RECOVERY_STAGE: stage,
         WORKER_DEFAULT_LOCK_DURATION: '3000',
+        NOVU_SMOKE_PROBE_JOB_ID: probeJobId,
+        ...(probeJobId && { STANDARD_WORKER_CONCURRENCY: '1' }),
       },
       onMessage
     );
@@ -241,7 +277,7 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
   });
 
   after(async () => {
-    await Promise.all([stop(worker), stop(webhook)]);
+    await Promise.all([stop(worker), stop(competingWorker), stop(webhook)]);
     const jobId = crashedQueueJobId;
     if (subscriberQueue && jobId) {
       await waitFor('test subscriber job removal after its lock expires', async () => {
@@ -255,6 +291,229 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
     }
     await subscriberQueue?.close();
     simulator.close();
+  });
+
+  function mongo() {
+    if (!mongoose.connection.db) throw new Error('Test MongoDB is disconnected');
+    return mongoose.connection.db;
+  }
+
+  async function redriveEmail(jobId: string, count = 1) {
+    const queue = testServer.getService(StandardQueueService).queue as ReturnType<BullMqService['createQueue']>;
+    const entries = await queue.addBulk(
+      Array.from({ length: count }, () => ({
+        name: 'provider-crash-replay',
+        data: {
+          _id: jobId,
+          _environmentId: session.environment._id,
+          _organizationId: session.organization._id,
+          _userId: session.user._id,
+        },
+        opts: { removeOnComplete: false, removeOnFail: false },
+      }))
+    );
+    await waitFor('the controlled replay deliveries to finish', async () =>
+      (await Promise.all(entries.map((entry) => entry.getState()))).every((state) => state === 'completed')
+        ? true
+        : undefined
+    );
+  }
+
+  async function expireJobClaim(jobId: string) {
+    await mongo()
+      .collection(jobs._model.collection.name)
+      .updateOne(
+        {
+          _id: new mongoose.Types.ObjectId(jobId),
+          _environmentId: new mongoose.Types.ObjectId(session.environment._id),
+        },
+        { $set: { updatedAt: new Date(Date.now() - 120_000) } }
+      );
+  }
+
+  function signedDelivery(providerId: string) {
+    const now = new Date();
+    const id = `msg_${randomUUID()}`;
+    const body = JSON.stringify({
+      type: 'email.delivered',
+      created_at: now.toISOString(),
+      data: { email_id: providerId },
+    });
+    return () =>
+      fetch(
+        `${webhookUrl}/webhooks/organizations/${session.organization._id}/environments/${session.environment._id}/email/${integrationId}`,
+        {
+          method: 'POST',
+          body,
+          headers: {
+            'content-type': 'application/json',
+            'svix-id': id,
+            'svix-timestamp': String(Math.floor(now.getTime() / 1000)),
+            'svix-signature': callbackSigner.sign(id, now, body),
+          },
+        }
+      );
+  }
+
+  async function replayAfterRestart(crashedJobId: string, subject: string, concurrent: boolean) {
+    const observedParticipants = new Set<ChildProcess>();
+    const observeReplay = (child: ChildProcess | undefined) => {
+      child?.on('message', (event) => {
+        if (
+          event &&
+          typeof event === 'object' &&
+          'providerReplayJobId' in event &&
+          event.providerReplayJobId === crashedJobId
+        )
+          observedParticipants.add(child);
+      });
+    };
+    const probe = concurrent ? crashedJobId : '';
+    await startWorker('', undefined, 'before-dispatch', probe);
+    if (probe) {
+      competingWorker = worker;
+      observeReplay(competingWorker);
+      await startWorker('', undefined, 'before-dispatch', probe);
+      observeReplay(worker);
+      slowReplays.add(subject);
+    }
+    try {
+      await redriveEmail(crashedJobId, probe ? 4 : 1);
+      if (probe) expect(observedParticipants.size).to.equal(2);
+    } finally {
+      await stop(competingWorker);
+      competingWorker = undefined;
+    }
+  }
+
+  for (const policy of ['recover', 'expired', 'changed'] as const) {
+    it(`handles provider acceptance before a worker crash with policy ${policy}`, async () => {
+      await stop(worker);
+      const title = `Provider acceptance crash ${policy}`;
+      const subject = `Scheduled: ${title}`;
+      const transactionId = randomUUID();
+      const query = transactionQuery(transactionId);
+      let jobId: string | undefined;
+      await startWorker(
+        transactionId,
+        (message) => {
+          jobId = message.persistedJobId;
+        },
+        'after-provider'
+      );
+      await trigger(transactionId, title);
+      const crashedJobId = await waitFor('provider response before MongoDB update', async () => jobId);
+      const before = await messages.find(query);
+      expect(before).to.have.length(1);
+      expect(before[0].identifier).to.equal(undefined);
+      expect(before[0].status).to.equal('warning');
+      const [first] = requests.filter((request) => request.subject === subject);
+      expect(first).to.exist;
+      const callback = signedDelivery(first.id);
+      expect((await callback()).status).to.equal(503);
+      await stop(worker, 'SIGKILL');
+
+      if (policy === 'expired') {
+        byKey.delete(`novu-email/${query._environmentId}/${crashedJobId}`);
+        await messages.update(
+          { ...query, _id: before[0]._id },
+          { $set: { 'data.resendDelivery.firstAttemptAt': Date.now() - 25 * 3_600_000 } }
+        );
+      }
+      if (policy === 'changed') {
+        await jobs.update({ ...query, _id: crashedJobId }, { $set: { 'payload.title': 'Changed after acceptance' } });
+      }
+      await expireJobClaim(crashedJobId);
+      await replayAfterRestart(crashedJobId, subject, policy === 'recover');
+
+      const stored = await messages.find(query);
+      expect(stored).to.have.length(1);
+      expect(stored[0]._id).to.equal(before[0]._id);
+      const observed = attempts.filter((attempt) => attempt.subject === subject);
+      expect(observed).to.have.length(policy === 'recover' ? 2 : 1);
+      expect(observed[0].key).to.equal(`novu-email/${query._environmentId}/${crashedJobId}`);
+      expect(observed.every(({ key }) => key === observed[0].key)).to.equal(true);
+      expect(requests.filter((request) => request.subject === subject)).to.have.length(1);
+      expect(attempts.some((attempt) => attempt.subject.includes('Changed after acceptance'))).to.equal(false);
+      const job = await jobs.findOne({ ...query, _id: crashedJobId });
+      if (policy === 'recover') {
+        expect(stored[0].identifier).to.equal(first.id);
+        expect(job?.status).to.equal(JobStatusEnum.COMPLETED);
+        expect((await callback()).status).to.equal(201);
+        expect(await details.find({ ...query, _messageId: stored[0]._id, webhookStatus: 'delivered' })).to.have.length(
+          1
+        );
+      } else {
+        expect(stored[0]).to.include({
+          status: 'warning',
+          errorId: policy === 'expired' ? 'resend_retry_window_expired' : 'resend_request_changed',
+        });
+        expect(stored[0].identifier).to.equal(undefined);
+        expect(job?.status).to.equal(JobStatusEnum.FAILED);
+        expect((await callback()).status).to.equal(503);
+      }
+    });
+  }
+
+  for (const fault of ['timeout', '500', '429', '409'] as const) {
+    it(`records the correct provider outcome after ${fault}`, async () => {
+      const title = `Provider fault ${fault}`;
+      const subject = `Scheduled: ${title}`;
+      const transactionId = randomUUID();
+      const query = transactionQuery(transactionId);
+      faults.set(subject, fault);
+      await trigger(transactionId, title);
+      const job = await waitFor(
+        'email to reach a terminal state',
+        async () => {
+          const result = await jobs.findOne({ ...query, type: StepTypeEnum.EMAIL });
+          return result && [JobStatusEnum.COMPLETED, JobStatusEnum.FAILED].includes(result.status) ? result : undefined;
+        },
+        25_000
+      );
+      const stored = await messages.find(query);
+      expect(stored).to.have.length(1);
+      const tries = attempts.filter((attempt) => attempt.subject === subject);
+      const accepted = requests.filter((request) => request.subject === subject);
+      const succeeds = fault === 'timeout' || fault === '500';
+      expect(tries).to.have.length(succeeds ? 2 : 1);
+      expect(tries[0].key).to.equal(`novu-email/${query._environmentId}/${job._id}`);
+      expect(tries.every(({ key }) => key === tries[0].key)).to.equal(true);
+      expect(accepted).to.have.length(succeeds ? 1 : 0);
+      expect(stored[0].identifier).to.equal(accepted[0]?.id);
+      expect(job.status).to.equal(succeeds ? JobStatusEnum.COMPLETED : JobStatusEnum.FAILED);
+      if (!succeeds) expect(stored[0].status).to.equal(fault === '429' ? 'error' : 'warning');
+    });
+  }
+
+  it('retains the attempt after MongoDB rejects acceptance persistence', async () => {
+    const title = 'Provider acceptance write failure';
+    const transactionId = randomUUID();
+    const query = transactionQuery(transactionId);
+    const collection = messages._model.collection.name;
+    await mongo().command({
+      collMod: collection,
+      validator: { $or: [{ transactionId: { $ne: transactionId } }, { identifier: { $exists: false } }] },
+    });
+    try {
+      await trigger(transactionId, title);
+      const job = await waitFor(
+        'persistence failure',
+        async () =>
+          (await jobs.findOne({ ...query, type: StepTypeEnum.EMAIL, status: JobStatusEnum.FAILED })) ?? undefined
+      );
+      expect(job.error).to.equal('Resend outcome uncertain');
+      const uncertain = await details.find({ ...query, detail: 'Resend outcome uncertain' });
+      expect(uncertain.some((row) => row.raw?.includes('resend_persistence_uncertain'))).to.equal(true);
+      const [message] = await messages.find(query);
+      expect(message.status).to.equal('warning');
+      expect(message.identifier).to.equal(undefined);
+      expect(message.data?.resendDelivery).to.have.property('attempts', 1);
+    } finally {
+      await mongo().command({ collMod: collection, validator: {} });
+    }
+    expect(requests.filter((request) => request.subject === `Scheduled: ${title}`)).to.have.length(1);
+    expect(attempts.filter((attempt) => attempt.subject === `Scheduled: ${title}`)).to.have.length(1);
   });
 
   it('correlates the trigger, persisted email, and simulated Resend acceptance and delivery', async () => {
@@ -273,8 +532,9 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
     expect(message._notificationId).to.equal(notification?._id);
     expect(job._notificationId).to.equal(notification?._id);
     expect(message.providerId).to.equal('resend');
-    expect(requests).to.have.length(1);
-    const [accepted] = requests;
+    const acceptedForTest = requests.filter((row) => row.subject === 'Scheduled: Synthetic interview');
+    expect(acceptedForTest).to.have.length(1);
+    const [accepted] = acceptedForTest;
     expect(accepted.id).to.equal(message.identifier);
     expect(accepted.from).to.include(sender);
     expect([accepted.to].flat()).to.deep.equal([recipient]);
@@ -324,7 +584,7 @@ describe('Resend smoke workflow (local HTTP simulation)', function () {
     expect(replays.map((response) => response.status)).to.deep.equal([201, 201, 201]);
     expect(await deliveryRecords()).to.have.length(1);
     expect((await messages.findOne({ ...query, _id: message._id }))?.status).to.equal('sent');
-    expect(requests).to.have.length(1);
+    expect(acceptedForTest).to.have.length(1);
 
     const bounceBody = JSON.stringify({ ...JSON.parse(body), type: 'email.bounced' });
     const bounceId = `msg_${randomUUID()}`;

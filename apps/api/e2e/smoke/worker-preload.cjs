@@ -18,6 +18,16 @@ if (process.send) {
   process.on('disconnect', () => process.exit(1));
 }
 
+const probeJobId = process.env.NOVU_SMOKE_PROBE_JOB_ID;
+if (probeJobId) {
+  const { RunJob } = require('../../../worker/dist/app/workflow/usecases/run-job/run-job.usecase');
+  const execute = RunJob.prototype.execute;
+  RunJob.prototype.execute = function observeReplay(command) {
+    if (command.jobId === probeJobId) process.send({ providerReplayJobId: probeJobId });
+    return execute.call(this, command);
+  };
+}
+
 const crashTransactionId = process.env.NOVU_SMOKE_CRASH_TRANSACTION_ID;
 if (crashTransactionId) {
   const stage = process.env.NOVU_SMOKE_RECOVERY_STAGE;
@@ -27,7 +37,17 @@ if (crashTransactionId) {
     return new Promise(() => {});
   };
 
-  if (stage === 'after-claim') {
+  if (stage === 'after-provider') {
+    const { MessageRepository } = require('../../../worker/node_modules/@novu/dal');
+    const update = MessageRepository.prototype.findOneAndUpdate;
+    MessageRepository.prototype.findOneAndUpdate = async function pauseBeforeProviderId(query, operation, options) {
+      if (operation.$set?.identifier) {
+        const message = await this.findOne(query);
+        if (message?.transactionId === crashTransactionId) return pause(message._jobId);
+      }
+      return update.call(this, query, operation, options);
+    };
+  } else if (stage === 'after-claim') {
     const queueJob = AddJob.prototype.queueJob;
     AddJob.prototype.queueJob = function pauseBeforeQueueWrite(params) {
       if (params.job.transactionId === crashTransactionId && !params.job._parentId) {

@@ -56,6 +56,8 @@ const mapDetailToEventType = {
   // Provider events
   [DetailEnum.PROVIDER_MISSING]: 'provider_missing',
   [DetailEnum.PROVIDER_ERROR]: 'provider_error',
+  [DetailEnum.RESEND_OUTCOME_UNCERTAIN]: 'provider_error',
+  [DetailEnum.RESEND_REJECTED]: 'provider_error',
   [DetailEnum.LIMIT_PASSED_NOVU_INTEGRATION]: 'provider_limit_exceeded',
 
   // Digest events

@@ -23,10 +23,12 @@ import {
 } from '@novu/application-generic';
 import {
   AgentRepository,
+  BaseRepository,
   EnvironmentEntity,
   EnvironmentRepository,
   IEmailBlock,
   IntegrationEntity,
+  isDuplicateKeyError,
   LayoutRepository,
   MessageEntity,
   MessageRepository,
@@ -53,6 +55,7 @@ import {
 import inlineCss from 'inline-css';
 
 import { PlatformException } from '../../../shared/utils';
+import { submitResendDelivery } from './resend-delivery';
 import { combineProviderOverrides, mergeTriggerProviderOverrides, SendMessageBase } from './send-message.base';
 import { SendMessageChannelCommand } from './send-message-channel.command';
 import { SendMessageResult, SendMessageStatus } from './send-message-type.usecase';
@@ -94,6 +97,25 @@ export class SendMessageEmail extends SendMessageBase {
   @InstrumentUsecase()
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Existing channel orchestration is outside this change.
   public async execute(command: SendMessageChannelCommand): Promise<SendMessageResult> {
+    const resendScope = {
+      _environmentId: command.environmentId,
+      _organizationId: command.organizationId,
+      _jobId: command.jobId,
+      channel: ChannelTypeEnum.EMAIL,
+      providerId: EmailProviderIdEnum.Resend,
+    };
+    const resendMessageId = BaseRepository.stableObjectId('resend-email', command.environmentId, command.jobId);
+    const existingResendMessage = await this.messageRepository.findOne(resendScope, undefined, {
+      query: { sort: { identifier: -1 } },
+    });
+    if (existingResendMessage?.identifier) {
+      command.job.providerId = EmailProviderIdEnum.Resend;
+      return { status: SendMessageStatus.SUCCESS };
+    }
+    if (existingResendMessage && existingResendMessage._id !== resendMessageId) {
+      return this.recordResendFailure(existingResendMessage, command, 'resend_legacy_outcome_uncertain');
+    }
+
     let selection: IntegrationSelectionResult | undefined;
     const { subscriber } = command.compileContext;
     const email: string | undefined = command.overrides?.email?.toRecipient || subscriber?.email;
@@ -165,6 +187,9 @@ export class SendMessageEmail extends SendMessageBase {
     }
 
     const { integration } = selection;
+    if (existingResendMessage && integration.providerId !== EmailProviderIdEnum.Resend) {
+      return this.recordResendFailure(existingResendMessage, command, 'resend_integration_changed');
+    }
     const bridgeOutputs = command.bridgeData?.outputs;
 
     const [template, overrideLayoutId] = await Promise.all([
@@ -208,7 +233,7 @@ export class SendMessageEmail extends SendMessageBase {
 
     const assignedAgentId = await this.resolveAssignedAgentId(command);
 
-    const message: MessageEntity = await this.messageRepository.create({
+    const messageData = {
       _notificationId: command.notificationId,
       _environmentId: command.environmentId,
       _organizationId: command.organizationId,
@@ -229,7 +254,11 @@ export class SendMessageEmail extends SendMessageBase {
       severity: command.severity,
       contextKeys: command.contextKeys,
       ...(assignedAgentId ? { _agentId: assignedAgentId } : {}),
-    });
+    };
+    const message =
+      integration.providerId === EmailProviderIdEnum.Resend
+        ? (existingResendMessage ?? (await this.createResendMessage(resendMessageId, messageData)))
+        : await this.messageRepository.create(messageData);
 
     let replyToAddress: string | undefined;
     if (command.step.replyCallback?.active) {
@@ -429,6 +458,29 @@ export class SendMessageEmail extends SendMessageBase {
     return await this.sendMessage(integration, mailData, message, command);
   }
 
+  private async createResendMessage(
+    _id: string,
+    data: Partial<MessageEntity> & Pick<MessageEntity, '_environmentId'>
+  ): Promise<MessageEntity> {
+    // The native _id index arbitrates concurrent first inserts. Message's
+    // soft-delete query middleware is intentionally kept off the insert.
+    try {
+      return await this.messageRepository.create({ ...data, _id, status: 'warning' });
+    } catch (error) {
+      if (!isDuplicateKeyError(error)) throw error;
+
+      const existing = await this.messageRepository.findOne({
+        _id,
+        _environmentId: data._environmentId,
+        _organizationId: data._organizationId,
+        _jobId: data._jobId,
+        providerId: EmailProviderIdEnum.Resend,
+      });
+      if (!existing) throw error;
+      return existing;
+    }
+  }
+
   private async resolveAssignedAgentId(command: SendMessageChannelCommand): Promise<string | null> {
     if (command.job._agentId !== undefined) {
       if (command.job._agentId === null) {
@@ -626,16 +678,28 @@ export class SendMessageEmail extends SendMessageBase {
     const mailFactory = new MailFactory();
     const mailHandler = mailFactory.getHandler(this.buildFactoryIntegration(integration), mailData.from);
 
+    const providerMail = {
+      ...mailData,
+      bridgeProviderData: combineProviderOverrides(
+        command.bridgeData,
+        command.overrides,
+        command.step.stepId,
+        integration.providerId
+      ),
+    };
+    const isResend = integration.providerId === EmailProviderIdEnum.Resend;
+    const resendOutcome = isResend
+      ? await submitResendDelivery(this.messageRepository, message, integration, providerMail, (mail) =>
+          mailHandler.send(mail)
+        ).catch(() => ({ status: 'uncertain' as const, reason: 'resend_persistence_uncertain' }))
+      : undefined;
+    if (resendOutcome && resendOutcome.status !== 'accepted') {
+      return this.recordResendFailure(message, command, resendOutcome.reason, resendOutcome.status === 'rejected');
+    }
+    if (resendOutcome && !resendOutcome.recorded) return { status: SendMessageStatus.SUCCESS };
+
     try {
-      const result = await mailHandler.send({
-        ...mailData,
-        bridgeProviderData: combineProviderOverrides(
-          command.bridgeData,
-          command.overrides,
-          command.step.stepId,
-          integration.providerId
-        ),
-      });
+      const result = resendOutcome?.result ?? (await mailHandler.send(providerMail));
 
       await this.sendWebhookMessage.execute({
         eventType: WebhookEventEnum.MESSAGE_SENT,
@@ -674,19 +738,22 @@ export class SendMessageEmail extends SendMessageBase {
         };
       }
 
-      await this.messageRepository.update(
-        { _environmentId: command.environmentId, _id: message._id },
-        {
-          $set: {
-            identifier: result.id,
-          },
-        }
-      );
+      if (!isResend) {
+        await this.messageRepository.update(
+          { _environmentId: command.environmentId, _id: message._id },
+          { $set: { identifier: result.id } }
+        );
+      }
 
       return {
         status: SendMessageStatus.SUCCESS,
       };
     } catch (error) {
+      if (isResend) {
+        Logger.warn({ messageId: message._id }, 'Resend acceptance saved but post-send records failed', LOG_CONTEXT);
+        return { status: SendMessageStatus.SUCCESS };
+      }
+
       await this.sendErrorStatus(
         message,
         'error',
@@ -737,6 +804,29 @@ export class SendMessageEmail extends SendMessageBase {
         errorMessage: DetailEnum.PROVIDER_ERROR,
       };
     }
+  }
+
+  private async recordResendFailure(
+    message: MessageEntity,
+    command: SendMessageChannelCommand,
+    reason: string,
+    rejected = false
+  ): Promise<SendMessageResult> {
+    const detail = rejected ? DetailEnum.RESEND_REJECTED : DetailEnum.RESEND_OUTCOME_UNCERTAIN;
+    await this.createExecutionDetails.execute(
+      CreateExecutionDetailsCommand.create({
+        ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+        messageId: message._id,
+        detail,
+        source: ExecutionDetailsSourceEnum.INTERNAL,
+        status: ExecutionDetailsStatusEnum.FAILED,
+        isTest: false,
+        isRetry: false,
+        raw: JSON.stringify({ reason }),
+      })
+    );
+
+    return { status: SendMessageStatus.FAILED, errorMessage: detail, shouldHalt: !rejected };
   }
 
   @Instrument()

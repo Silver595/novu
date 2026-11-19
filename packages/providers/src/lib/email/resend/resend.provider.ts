@@ -88,31 +88,39 @@ export class ResendEmailProvider extends BaseProvider implements IEmailProvider 
   }
 
   async sendMessage(
-    options: IEmailOptions,
+    options: IEmailOptions & { providerIdempotencyKey?: string },
     bridgeProviderData: WithPassthrough<Record<string, unknown>> = {}
   ): Promise<ISendMessageSuccessResponse> {
     const senderName = options.senderName || this.config?.senderName;
     const fromAddress = options.from || this.config.from;
 
-    const response = await this.resendClient.emails.send(
-      this.transform<CreateEmailOptions>(bridgeProviderData, {
-        from: senderName ? `${senderName} <${fromAddress}>` : fromAddress,
-        to: options.to,
-        subject: options.subject,
-        text: options.text,
-        html: options.html,
-        cc: options.cc,
-        replyTo: options.replyTo || null,
-        attachments: options.attachments?.map((attachment) => ({
-          filename: attachment?.name,
-          content: attachment.file,
-          contentId: attachment.cid,
-        })),
-        bcc: options.bcc,
-        headers: options.headers,
-      } satisfies CreateEmailOptions).body
-    );
+    const body = this.transform<CreateEmailOptions>(bridgeProviderData, {
+      from: senderName ? `${senderName} <${fromAddress}>` : fromAddress,
+      to: options.to,
+      subject: options.subject,
+      text: options.text,
+      html: options.html,
+      cc: options.cc,
+      replyTo: options.replyTo || null,
+      attachments: options.attachments?.map((attachment) => ({
+        filename: attachment?.name,
+        content: attachment.file,
+        contentId: attachment.cid,
+      })),
+      bcc: options.bcc,
+      headers: options.headers,
+    } satisfies CreateEmailOptions).body;
+    const requestOptions = {
+      idempotencyKey: options.providerIdempotencyKey,
+      signal: options.providerIdempotencyKey ? AbortSignal.timeout(15_000) : undefined,
+    };
+    const response = options.providerIdempotencyKey
+      ? await this.resendClient.emails.send(body, requestOptions)
+      : await this.resendClient.emails.send(body);
 
+    if (response.error && options.providerIdempotencyKey) {
+      throw Object.assign(new Error(response.error.message), { resendCode: response.error.name });
+    }
     if (isResendError(response)) {
       throw new Error(response.error.error);
     } else if (response.error) {
@@ -197,7 +205,7 @@ export class ResendEmailProvider extends BaseProvider implements IEmailProvider 
     headers = {},
     body: _body,
   }: {
-    rawBody: any;
+    rawBody: unknown;
     headers?: Record<string, string>;
     body?: Record<string, unknown>;
   }): Promise<{ success: boolean; message?: string }> {
@@ -217,6 +225,10 @@ export class ResendEmailProvider extends BaseProvider implements IEmailProvider 
 
       if (rawBody === undefined) {
         return { success: false, message: 'Body is undefined' };
+      }
+
+      if (typeof rawBody !== 'string' && !Buffer.isBuffer(rawBody)) {
+        return { success: false, message: 'Invalid raw body' };
       }
 
       const webhook = new Webhook(webhookSigningKey);

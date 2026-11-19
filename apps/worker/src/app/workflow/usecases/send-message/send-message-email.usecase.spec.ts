@@ -30,6 +30,7 @@ describe('SendMessageEmail - email-webhook payloadDetails', () => {
   function buildUsecase(stubSelectionExecution = true) {
     const createExecutionDetails = { execute: sinon.stub().resolves(undefined) };
     const messageRepository = {
+      findOne: sinon.stub().resolves(null),
       create: sinon.stub().resolves({ _id: 'msg_1' }),
       update: sinon.stub().resolves(undefined),
     };
@@ -368,6 +369,7 @@ describe('SendMessageEmail - agent sender / reply-to precedence', () => {
   function buildUsecase(agentStubs?: { replyTo?: string; senderName?: string; senderEmail?: string }) {
     const createExecutionDetails = { execute: sinon.stub().resolves(undefined) };
     const messageRepository = {
+      findOne: sinon.stub().resolves(null),
       create: sinon.stub().resolves({ _id: MESSAGE_ID }),
       update: sinon.stub().resolves(undefined),
     };

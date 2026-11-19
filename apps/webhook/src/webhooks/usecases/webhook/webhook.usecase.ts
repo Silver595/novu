@@ -4,6 +4,7 @@ import {
   Logger,
   NotFoundException,
   Scope,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import {
@@ -145,6 +146,10 @@ export class Webhook {
     });
 
     if (!message) {
+      if (resendDelivery) {
+        throw new ServiceUnavailableException('Resend message correlation is not available yet');
+      }
+
       Logger.error(`Message with ${messageIdentifier} as identifier was not found`);
 
       return;
