@@ -67,7 +67,7 @@ The baseline reproduced two accepted emails. With the fix, two replacement worke
 
 ## Verification
 
-All 13 smoke cases passed against MongoDB, Redis, ClickHouse, and the loopback Resend simulator. The Community API, worker, and webhook builds passed.
+The Phase 3 local run on November 19, 2026 used source revision `7ecdbd97c1`. All 13 smoke cases passed against MongoDB, Redis, ClickHouse, and the loopback Resend simulator. The Community API, worker, and webhook builds passed.
 
 ```sh
 pnpm --filter @novu/worker test
@@ -91,6 +91,24 @@ pnpm --filter @novu/webhook test:e2e
 ```
 
 The worker suite passed 449 cases, worker E2E passed one, the provider spec passed three, and the workflow-planning spec passed 19. The API idempotency suite passed 12 E2E and nine unit tests. The dedicated webhook security suite passed all ten with its local MongoDB fixture. The full legacy webhook suite completed with 13 passes and two SendGrid response assertions failing on string versus object serialization. Both failures reproduced using the archived webhook source from `bf777e64ff`.
+
+## Live Resend verification
+
+The live verification on source revision `7ecdbd97c1` is blocked. The local session had no supplied live credentials, approved sender or recipient, send authorization, or approved webhook ingress. The local services and signing checks use generated fixture credentials. There is no live HTTP response, real provider ID, callback receipt, or observed recipient delivery for this run.
+
+### Before the send
+
+1. Use a dedicated Novu development environment with one active Resend email integration and a single-step smoke workflow. Supply the Resend API key through the approved secret channel. Confirm the From address and the authorized test recipient before triggering. Resend offers labeled test recipients that generate provider-side simulated delivery or bounce events and count against quota. A signed callback from a Resend test address verifies the provider-to-Novu path. An approved mailbox is needed to verify delivery to that mailbox. [Resend test recipients](https://resend.com/docs/dashboard/emails/send-test-emails)
+2. Use the already approved HTTPS callback endpoint for the legacy webhook service at `/webhooks/organizations/<organizationId>/environments/<environmentId>/email/<integrationId>`. Set `IS_LEGACY_WEBHOOK_SIGNATURE_VERIFICATION_ENABLED=true` for the webhook service, and store that endpoint's signing secret in the Resend integration's `configurations.inboundWebhookSigningKey`. Confirm the route preserves raw request bytes and the three Svix headers. Verify that an unsigned request and an invalid signature return HTTP 401 for this integration before accepting Resend events. Keep the route private if this check fails or public ingress is unavailable. [Resend signature verification](https://resend.com/docs/webhooks/verify-webhooks-requests)
+3. Check API and worker health and their MongoDB and Redis connections. Verify that the worker uses the live Resend host and a mode that permits outbound email. The Mocha smoke harness always routes email to loopback. Set `check: false` when configuring the integration through the API. The provider check itself submits an email and would consume the one-send budget.
+
+### Capture and replay
+
+1. Trigger once with a unique transaction ID and a searchable, non-personal subject marker. Record the UTC submission time and Novu response. Confirm one notification intent for the subscriber and workflow, and record the original job IDs and sole email message ID.
+2. In the matching Resend account, use **Logs** to capture the send HTTP status and provider-assigned email ID. Compare that ID with the Novu message's `identifier` and verify the email job reached `completed`. Record provider acceptance separately from the delivery result. [Resend request logs](https://resend.com/changelog/logs-api)
+3. In Resend **Webhooks**, find the corresponding delivery attempt. Match its `data.email_id` to the stored identifier, confirm Resend marks Novu's response successful, and verify one linked Novu execution detail with `webhookStatus: delivered`. If safe in that environment, replay the original webhook message from Resend and verify the detail count stays at one. Record the original and replayed Svix IDs privately to verify the deduplication identity. Use simulation for bounce and destructive cases unless another provider send is explicitly authorized. [Resend webhook retries and replays](https://resend.com/docs/webhooks/retries-and-replays)
+
+Keep the actual IDs and response evidence in a restricted incident or test record. Use placeholders in the repository and omit recipient information, credentials, signatures, and raw provider payloads.
 
 ## Limits to production use
 
