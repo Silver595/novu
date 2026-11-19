@@ -49,17 +49,32 @@ Use the generated values only for this simulator. The suite submits the API key 
 | Provider acceptance | MongoDB stores the provider ID in the email message's `identifier` and the step reaches `completed`. The message status reads `sent`. The suite logs synthetic transaction, notification, message, job, and provider IDs. |
 | Signed callback | A valid `email.delivered` callback returns HTTP 201 and appends a `Success` execution detail with `webhookStatus: delivered`, linked to the same message and transaction. The message status remains `sent`. |
 | Signature rejection | A missing signature and a signature submitted with altered raw bytes both return HTTP 401 and create no delivery record. |
-| Replay | Resubmitting the same valid callback ID and signature returns HTTP 201 and writes a second delivery detail. The simulator still observes one send for that transaction. |
+| Replay | Sequential and concurrent retries of the same authenticated Svix ID return HTTP 201 and retain one detail. A distinct signed bounce for the same message creates its own detail. |
 
 ## Worker crash at the persistence handoff
 
-The test preloads a hook in one worker process for one synthetic transaction. The hook pauses at `AddJob.execute` after `StoreSubscriberJobs` has saved the jobs and before dispatch. At that checkpoint, the test reads one MongoDB notification and a pending job, with zero email messages and zero provider requests for the transaction. It sends SIGKILL to the paused process, starts a fresh worker without the hook, and waits for BullMQ's stalled-job check. The verified recovery case took about 70 seconds, including worker startup.
+The test pauses the first worker after `StoreSubscriberJobs` persists the chain and before `AddJob.execute` dispatches it. It records the subscriber queue ID, transaction and environment IDs, subscriber IDs, notification ID, and original jobs. The first SIGKILL causes BullMQ to stall and redeliver the same subscriber job. The replacement worker claims the existing root, leaving it `queued` with `awaitingEnqueue: true`. The test kills that worker before Redis accepts the root.
 
-The replacement worker replayed subscriber processing and completed the email. MongoDB held two notifications for the same transaction. The first jobs remained pending, and the replay created a new completed job chain. The simulator accepted one request, and MongoDB contained one correlated email message. A restart recovered the send in this specific window and left a duplicate persisted intent and stranded jobs. The test covers a crash before dispatch. The result makes no claim about a crash after provider acceptance, Redis data loss, or exactly-once delivery.
+The harness submits three fresh copies of the subscriber work concurrently, then submits a fourth after completion. All copies converge on the original notification and original job IDs. The simulator observes one send, and MongoDB holds one correlated email and one send execution detail. The suite also races two initial subscriber jobs before either MongoDB notification write, lets MongoDB reject a root insert and verifies that a retry reuses the persisted tail, and verifies two recipients and two ordered email steps per recipient in a separate API trigger.
+
+The callback case submits a valid delivery, checks callback replays, and then uses a temporary MongoDB collection validator to reject a distinct bounce write. The rejected write produces an HTTP error and adds zero records. After the validator is restored, concurrent retries write one bounce detail. See [failure modes and recovery](FAILURE-MODES.md) for operational limits.
+
+## Verification
+
+The five smoke cases passed against MongoDB, Redis, ClickHouse, and the loopback Resend simulator. The Community API, worker, and webhook builds passed.
+
+```sh
+pnpm --filter @novu/worker test
+pnpm --filter @novu/worker test:e2e
+pnpm --filter @novu/providers test --run resend.provider.spec.ts
+pnpm --filter @novu/application-generic exec vitest run src/usecases/create-notification-jobs/create-notification-jobs.spec.ts
+```
+
+The worker suite passed 449 cases, worker E2E passed one, the provider spec passed three, and the workflow-planning spec passed 19. The API idempotency suite passed 12 E2E and nine unit tests. The dedicated webhook security suite passed all ten with its local MongoDB fixture. The full legacy webhook suite completed with 13 passes and two SendGrid response assertions failing on string versus object serialization. Both failures reproduced using the archived webhook source from `bf777e64ff`.
 
 ## Limits to production use
 
 - The legacy webhook accepts callbacks when the Resend signing key is absent. Keep ingress private until signing-key presence and signature rejection are verified in the deployed configuration. The Community Compose manifest does not start the webhook service.
-- Callback IDs are not deduplicated in the observed path. Activity consumers should expect repeated delivery details. Callback ordering and early callbacks before provider-ID persistence remain unverified.
-- The restart test exercises a recoverable Redis stall and exposes duplicate persisted intent. Provider timeouts after acceptance and Redis durability under node loss remain open.
+- Older callback rows created before the change have no replay identity. Callback ordering and early callbacks before provider-ID persistence remain unverified.
+- BullMQ bounds stalled-job recovery. The second injected crash uses fresh subscriber deliveries to verify the stored state remains recoverable. Provider timeouts after acceptance and Redis durability under node loss remain open.
 - The local delivery callback is simulated. Real Resend acceptance, account limits, verified-domain behavior, ingress, and actual delivery still require an authorized test account and endpoint.

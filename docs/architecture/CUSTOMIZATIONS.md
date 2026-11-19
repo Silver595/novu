@@ -1,0 +1,8 @@
+# Notification customizations
+
+| Requirement | Existing behavior | Change and verification | Compatibility and limits |
+| --- | --- | --- | --- |
+| Resume subscriber work after a worker dies before first dispatch | Subscriber redelivery created new notification and step IDs. The original pending chain remained in MongoDB. | Subscriber binding reuses the persisted root. The DAL uses MongoDB's existing `_id` index for atomic inserts and stores the ordered chain tail first. Root dispatch reuses the existing enqueue marker and execution claim. The Resend smoke suite covers two crashes, a partial chain write, concurrent first delivery and replay, multiple recipients and step order. | No new index or data migration. Fully persisted legacy chains can resume. A partial plan that changes before retry may require reconciliation. Existing queue retry and provider acceptance limits still apply. |
+| Record each authenticated Resend callback once | The legacy webhook inserted an execution detail for every request. | The legacy webhook uses a verified Svix delivery ID scoped to its integration for an atomic execution-detail insert. The Resend smoke suite covers invalid signatures, concurrent replays, distinct event types, MongoDB rejection and retry. | Other providers and legacy unsigned handling retain their prior behavior. Existing detail rows have no replay key. |
+
+The subscriber change adds one scoped notification lookup per delivery and reads persisted steps after the bulk write. This enables reuse of older root IDs and returns the actual stored status when inserts race. A replay with an existing root skips plan creation and the bulk write. The callback's atomic upsert replaces its previous insert.
