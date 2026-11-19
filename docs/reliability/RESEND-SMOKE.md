@@ -59,15 +59,35 @@ The harness submits three fresh copies of the subscriber work concurrently, then
 
 The callback case submits a valid delivery, checks callback replays, and then uses a temporary MongoDB collection validator to reject a distinct bounce write. The rejected write produces an HTTP error and adds zero records. After the validator is restored, concurrent retries write one bounce detail. See [failure modes and recovery](FAILURE-MODES.md) for operational limits.
 
+## Resend acceptance before persistence
+
+The simulator retains the first response for an idempotency key and tracks accepted emails separately from HTTP attempts. A worker preload pauses the real process after the provider response and before MongoDB saves the ID. The harness kills the process, expires the test lease, and runs replay deliveries. It also exercises socket timeout after acceptance, HTTP 500, HTTP 429, a provider conflict, and MongoDB rejecting the acceptance write. The time-expiry case removes the simulator's key record and ages the durable first-attempt timestamp past Resend's 24-hour window.
+
+The baseline reproduced two accepted emails. With the fix, two replacement workers receive competing deliveries of the original email job. An eligible replay uses the same key and recovers the original provider ID. MongoDB retains one correlated message and the simulator records one accepted email. A socket timeout after acceptance also results in one acceptance across two HTTP attempts. Expired and changed requests are held without resubmission. Signed callbacks before correlation return 503 and can be replayed after the provider ID is stored. See [failure modes](FAILURE-MODES.md) for the difference between acceptance and delivery and the conditions requiring operator reconciliation.
+
 ## Verification
 
-The five smoke cases passed against MongoDB, Redis, ClickHouse, and the loopback Resend simulator. The Community API, worker, and webhook builds passed.
+All 13 smoke cases passed against MongoDB, Redis, ClickHouse, and the loopback Resend simulator. The Community API, worker, and webhook builds passed.
 
 ```sh
 pnpm --filter @novu/worker test
 pnpm --filter @novu/worker test:e2e
 pnpm --filter @novu/providers test --run resend.provider.spec.ts
 pnpm --filter @novu/application-generic exec vitest run src/usecases/create-notification-jobs/create-notification-jobs.spec.ts
+pnpm --filter @novu/webhook test:e2e
+
+(
+  cd apps/api
+  pnpm exec mocha --no-config --timeout 15000 --require @novu/testing/swc-register --exit \
+    src/app/shared/framework/idempotency.interceptor.spec.ts src/app/shared/framework/idempotency-http-error.spec.ts
+)
+
+(
+  cd apps/webhook
+  MONGO_URL=mongodb://127.0.0.1:27017/novu-webhook-security-test PORT=1488 \
+    pnpm exec mocha --no-config --timeout 10000 --require @novu/testing/swc-register --exit \
+    --file e2e/setup.ts src/webhooks/e2e/webhook-security.e2e.ts
+)
 ```
 
 The worker suite passed 449 cases, worker E2E passed one, the provider spec passed three, and the workflow-planning spec passed 19. The API idempotency suite passed 12 E2E and nine unit tests. The dedicated webhook security suite passed all ten with its local MongoDB fixture. The full legacy webhook suite completed with 13 passes and two SendGrid response assertions failing on string versus object serialization. Both failures reproduced using the archived webhook source from `bf777e64ff`.
@@ -75,6 +95,6 @@ The worker suite passed 449 cases, worker E2E passed one, the provider spec pass
 ## Limits to production use
 
 - The legacy webhook accepts callbacks when the Resend signing key is absent. Keep ingress private until signing-key presence and signature rejection are verified in the deployed configuration. The Community Compose manifest does not start the webhook service.
-- Older callback rows created before the change have no replay identity. Callback ordering and early callbacks before provider-ID persistence remain unverified.
-- BullMQ bounds stalled-job recovery. The second injected crash uses fresh subscriber deliveries to verify the stored state remains recoverable. Provider timeouts after acceptance and Redis durability under node loss remain open.
+- Older callback rows created before the change have no replay identity. Signed Resend callbacks before provider-ID persistence return a retryable 503. Ordering of different callback event types remains unverified.
+- BullMQ bounds stalled-job recovery. The second injected crash uses fresh subscriber deliveries to verify the stored state remains recoverable. Provider timeouts after acceptance are exercised against the simulator. Redis durability under node loss remains open.
 - The local delivery callback is simulated. Real Resend acceptance, account limits, verified-domain behavior, ingress, and actual delivery still require an authorized test account and endpoint.

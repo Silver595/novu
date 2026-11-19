@@ -1,4 +1,4 @@
-# Subscriber dispatch and callback recovery
+# Notification failure modes and recovery
 
 ## Reproduced failure
 
@@ -26,6 +26,32 @@ On baseline `bf777e64ff`, Redis redelivered subscriber queue job `2` for transac
 | Persisted email | `6afe619f7fcf4101e55ee70f` |
 | Simulated Resend acceptance | `29bde244-8c9f-4057-9428-43aaf302537a` |
 | Send execution detail | `6afe619f7fcf4101e55ee716` |
+
+## Resend submission and uncertain outcomes
+
+On `8774b492ec`, the local simulator accepted two distinct sends for transaction `739be707-2f33-481d-9a3f-9e301ad28591` and email job `cc08e7f45952c2b76650df92` after a worker was killed before saving the first provider ID. The simulator assigned `6c6b92d1-1fc3-4e50-8dad-683f707635eb` and `3c2a94bd-e6b5-4a80-ba8c-f6e0434983f9`. MongoDB retained two messages for that same job, one without an identifier. Redis replay reacquired the stale MongoDB lease and ran the email step again. The baseline adapter omitted an idempotency key.
+
+### Persistence boundary
+
+1. BullMQ delivers the email step and `RunJob` claims it in MongoDB. The existing running lease and heartbeat fence live workers. BullMQ may redeliver a stalled job.
+2. The worker reserves one message for the Resend step. It uses the same message ID to render reply-to addresses on a retry. Existing legacy Resend messages with a provider ID can resume without sending. Legacy messages without a provider ID are held for inspection because they may have been sent without a key.
+3. After rendering, a MongoDB conditional write reserves the attempt before HTTP. The document stores the first-attempt time, attempt budget and a SHA-256 fingerprint of the request and integration credential configuration. This record stays on the existing message, with no new collection or migration. The worker will hold when the integration or prepared request changes. The key uses the environment and email-job IDs and contains no recipient address.
+4. Installed SDK 6.0.3 accepts an `idempotencyKey` option and sends it as the HTTP `Idempotency-Key` header. Resend documents a 24-hour window and permits up to 256 characters. Within that window a matching request replays the original ID. A different request under the same key can return a conflict. [Resend idempotency keys](https://resend.com/docs/dashboard/emails/idempotency-keys).
+5. The worker saves the provider ID before the send detail and outbound message webhook. It repeats a failed MongoDB write once using the same observed ID. If both writes fail, the durable attempt remains unresolved and the workflow records uncertainty if storage permits. An already saved ID fences later provider submissions even if the job was never marked complete.
+6. The worker records its step outcome in MongoDB and the step-run history. Provider acceptance supplies an ID. Recipient delivery is recorded only when a correlated callback reports it. A crash after saving the ID can leave the supplementary send detail or outbound message webhook absent.
+
+### Retry decisions
+
+| Outcome | Behavior |
+| --- | --- |
+| Network timeout, SDK connection error, 500, or a concurrent idempotency request in progress | One bounded inline retry with the same key and fingerprint after a short pause. Each call has a 15-second deadline. An eligible BullMQ redelivery can reuse remaining budget. |
+| First request returns 429 or a classified definitive rejection | Record rejection and halt provider attempts. A later request rejection cannot rule out acceptance of an earlier attempt. The SDK error response does not expose `Retry-After` to this worker path. |
+| Same key rejected for conflicting content, unknown response, or a changed request or integration | Keep the outcome uncertain and retain the original message and attempt. A changed request is held before HTTP. |
+| First attempt at least 23 hours old, clock earlier than the recorded first attempt, or three reservations consumed | Hold without submitting another request. The local cutoff leaves a one-hour margin within the documented provider window. |
+| Valid signed callback arrives before correlation is saved | Return HTTP 503 for Resend so the event can be retried. Once the provider ID is stored, the callback correlates and retains its existing replay deduplication. |
+| Valid signed callback arrives after a terminal uncertain outcome with no stored provider ID | Remain unresolved and return HTTP 503. Confirm the provider ID in authorized Resend records and verify the matching Novu attempt before reconciliation. Replay the provider callback once the identifier is known. Never infer acceptance or resend from an unmatched event or a missing detail alone. [Webhook retries and replays](https://resend.com/docs/webhooks/retries-and-replays). |
+
+The worker reserves at most three provider requests per message and makes at most two per execution. A failed workflow has no automatic indefinite retry. Operator reconciliation is required after an uncertain terminal result, expired window, or changed request. An operator can inspect the message ID, job ID, attempt metadata and Resend logs to distinguish accepted, rejected and unresolved outcomes before taking action. The guarantees assume retained MongoDB records, consistent clocks and a single provider idempotency scope. Live Resend, mixed-version workers, Redis data loss and SQS replay were outside this verification.
 
 ## Callback recovery contract
 
